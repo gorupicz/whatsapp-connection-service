@@ -22,6 +22,7 @@ import {
 import NodeCache from 'node-cache';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
+import QRCode from 'qrcode';
 import path from 'path';
 import { promises as fs } from 'fs';
 import crypto from 'crypto';
@@ -84,6 +85,59 @@ app.get('/liveness', (req, res) => {
 });
 
 app.use(express.json());
+
+// ---- Request authentication -------------------------------------------------
+// Every endpoint registered below this point can act as the paired WhatsApp
+// account: send messages, create groups, add participants, read pending join
+// requests. Without a shared secret, anyone who learns this service's URL can
+// do all of that. So the key is REQUIRED: a fresh deployment refuses to boot
+// rather than come up silently wide open. The escape hatch is explicit and has
+// to be typed on purpose.
+//
+// The health endpoints (`/`, `/health`, `/liveness`) are registered above and
+// stay public deliberately — PaaS health probes cannot send custom headers.
+const SERVICE_API_KEY = process.env.SERVICE_API_KEY || '';
+const ALLOW_UNAUTHENTICATED = process.env.ALLOW_UNAUTHENTICATED === '1';
+
+if (!SERVICE_API_KEY && !ALLOW_UNAUTHENTICATED) {
+  console.error(
+    '[Service] FATAL: SERVICE_API_KEY is not set, so every endpoint would be ' +
+    'open to anyone who knows this URL — including sending messages and ' +
+    'creating groups as the paired account. Set SERVICE_API_KEY to a long ' +
+    'random string, or set ALLOW_UNAUTHENTICATED=1 if this service is ' +
+    'genuinely unreachable from the internet.',
+  );
+  process.exit(1);
+}
+
+if (!SERVICE_API_KEY) {
+  console.warn(
+    '[Service] WARNING: running WITHOUT request authentication ' +
+    '(ALLOW_UNAUTHENTICATED=1). Anyone who can reach this URL controls the ' +
+    'paired WhatsApp account.',
+  );
+}
+
+function apiKeyMatches(given) {
+  const a = Buffer.from(given);
+  const b = Buffer.from(SERVICE_API_KEY);
+  // timingSafeEqual throws on a length mismatch, so compare lengths first. The
+  // length of a rejected key is not worth protecting; its content is.
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+app.use((req, res, next) => {
+  if (!SERVICE_API_KEY) return next();
+  // A CORS preflight cannot carry the custom header by definition.
+  if (req.method === 'OPTIONS') return next();
+
+  const given = req.get('x-api-key') || '';
+  if (!given || !apiKeyMatches(given)) {
+    console.warn(`[Service] 401 ${req.method} ${req.path}`);
+    return res.status(401).json({ success: false, error: 'Unauthorized' });
+  }
+  next();
+});
 
 const PORT = process.env.PORT || 3001;
 const AUTH_DIR = process.env.AUTH_DIR || path.join(process.cwd(), 'whatsapp_auth');
@@ -1024,15 +1078,28 @@ app.use((req, res, next) => {
  * GET /qr
  * Obtener QR code actual
  */
-app.get('/qr', (req, res) => {
+app.get('/qr', async (req, res) => {
   console.log('[API] GET /qr - Checking for QR code');
-  if (currentQRCode) {
-    console.log('[API] QR code found, returning to client');
-    res.json({ success: true, qrCode: currentQRCode });
-  } else {
+  if (!currentQRCode) {
     console.log('[API] No QR code available');
-    res.json({ success: false, message: 'No QR code available' });
+    return res.json({ success: false, message: 'No QR code available' });
   }
+
+  console.log('[API] QR code found, returning to client');
+
+  // `qrCode` is the raw Baileys payload and stays the contract for existing
+  // callers. `qrImage` is the same payload rendered to a PNG data URL so a
+  // browser can display it with a plain <img> and no client-side QR library.
+  let qrImage = null;
+  try {
+    qrImage = await QRCode.toDataURL(currentQRCode, { margin: 1, width: 320 });
+  } catch (error) {
+    // A render failure must not withhold the raw payload: a caller that can
+    // draw its own QR should still be able to.
+    console.error('[API] QR render failed:', error?.message || error);
+  }
+
+  res.json({ success: true, qrCode: currentQRCode, qrImage });
 });
 
 /**
@@ -1561,6 +1628,105 @@ function extractInviteCode(groupUrl) {
     return match ? match[1] : null;
   }
 }
+
+/**
+ * POST /group/create
+ * Create a group owned by the paired account.
+ *
+ * `participants` may be empty: WhatsApp allows a group of one, which is the
+ * useful shape when the other people are meant to arrive through the invite
+ * link rather than being added outright. The invite URL is resolved in the
+ * same call because that is what every caller wants next, and a second
+ * round-trip is another chance for the socket to drop in between.
+ */
+app.post('/group/create', async (req, res) => {
+  try {
+    const { subject, participants } = req.body;
+
+    if (!subject || typeof subject !== 'string' || !subject.trim()) {
+      return res.status(400).json({ success: false, error: 'subject is required' });
+    }
+    if (participants !== undefined && !Array.isArray(participants)) {
+      return res.status(400).json({ success: false, error: 'participants must be an array of JIDs' });
+    }
+
+    const sock = socket || await initSocket();
+    if (!sock || connectionState !== 'open') {
+      return res.status(503).json({ success: false, error: 'WhatsApp not connected' });
+    }
+
+    const list = participants || [];
+    console.log('[API] Creating group:', { subject, participants: list.length });
+
+    const group = await sock.groupCreate(subject.trim(), list);
+    const groupJid = group?.id;
+    if (!groupJid) {
+      return res.status(502).json({ success: false, error: 'Group created but no JID returned' });
+    }
+
+    // Which participants actually made it in. WhatsApp silently drops numbers
+    // that block group adds, so the caller must be able to tell.
+    const added = (group?.participants || []).map((p) => p.id || p.jid).filter(Boolean);
+
+    let inviteUrl = null;
+    let inviteCode = null;
+    try {
+      inviteCode = await sock.groupInviteCode(groupJid);
+      inviteUrl = `https://chat.whatsapp.com/${inviteCode}`;
+    } catch (error) {
+      // The group exists either way; report it and let the caller retry the
+      // link via /group/invite-url rather than losing the group entirely.
+      console.error('[API] Group created but invite code failed:', error?.message || error);
+    }
+
+    res.json({
+      success: true,
+      groupJid,
+      subject: group?.subject || subject.trim(),
+      participants: added,
+      inviteCode,
+      inviteUrl,
+    });
+  } catch (error) {
+    console.error('[API] Error creating group:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * POST /group/invite-url
+ * Current invite link for a group the paired account administers.
+ *
+ * Note this returns the group's *live* code: whoever holds it can join. Calling
+ * WhatsApp's revoke is deliberately not exposed here — rotating a link people
+ * were already given is a decision for a human, not a side effect of a lookup.
+ */
+app.post('/group/invite-url', async (req, res) => {
+  try {
+    const { groupId } = req.body;
+
+    if (!groupId) {
+      return res.status(400).json({ success: false, error: 'groupId is required' });
+    }
+
+    const sock = socket || await initSocket();
+    if (!sock || connectionState !== 'open') {
+      return res.status(503).json({ success: false, error: 'WhatsApp not connected' });
+    }
+
+    const inviteCode = await sock.groupInviteCode(groupId);
+
+    res.json({
+      success: true,
+      groupId,
+      inviteCode,
+      inviteUrl: `https://chat.whatsapp.com/${inviteCode}`,
+    });
+  } catch (error) {
+    console.error('[API] Error getting invite url:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
 
 /**
  * POST /group/join

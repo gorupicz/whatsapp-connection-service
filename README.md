@@ -32,12 +32,36 @@ Then pair your number:
 2. `GET /qr` to fetch the current QR code, and scan it from **WhatsApp → Linked devices**.
 3. `GET /status` should now report `connected: true`. Credentials are saved under `AUTH_DIR` and reused on restart.
 
+## Authentication
+
+Every endpoint except the health checks (`/`, `/health`, `/liveness`) requires a
+shared secret sent as the `x-api-key` header:
+
+```bash
+curl -H "x-api-key: $SERVICE_API_KEY" https://your-service/status
+```
+
+This is not optional, and the default is fail-closed: **the service exits on
+startup if `SERVICE_API_KEY` is unset.** The reason is that every other endpoint
+can act as the paired WhatsApp account — send messages, create groups, add
+participants, read pending join requests — so an unauthenticated deployment
+hands control of that account to anyone who learns its URL.
+
+If the service genuinely cannot be reached from the internet (a private network,
+a local socket), set `ALLOW_UNAUTHENTICATED=1` to waive the requirement. It
+starts with a warning on every boot.
+
+The health checks stay public because PaaS health probes cannot send custom
+headers; they expose only a connected/disconnected boolean.
+
 ## Configuration
 
 All configuration is via environment variables. See [`.env.example`](.env.example) for the full list with defaults.
 
 | Variable | Default | Description |
 |---|---|---|
+| `SERVICE_API_KEY` | — | **Required.** Shared secret every request must send as the `x-api-key` header. The service refuses to boot without it — see [Authentication](#authentication). |
+| `ALLOW_UNAUTHENTICATED` | `0` | Set `1` to run with no request auth (only for a service unreachable from the internet). Ignored when `SERVICE_API_KEY` is set. |
 | `PORT` | `3001` | HTTP port (most PaaS hosts assign this automatically). |
 | `AUTH_DIR` | `./whatsapp_auth` | Where Baileys stores session credentials. **Use a persistent volume in production** or you'll have to re-scan the QR after every deploy. |
 | `WHATSAPP_WEBHOOK_URL` | — | URL that inbound messages are POSTed to. If unset, inbound forwarding is skipped. |
@@ -72,7 +96,7 @@ All configuration is via environment variables. See [`.env.example`](.env.exampl
 | `GET` | `/liveness` | Honest liveness: timestamp of the last real inbound message. |
 | `GET` | `/status` | Detailed connection status. |
 | `GET` | `/events` | Server-Sent Events stream of connection state changes. |
-| `GET` | `/qr` | Current QR code (while pairing). |
+| `GET` | `/qr` | Current QR code (while pairing). Returns `qrCode` (raw Baileys payload) and `qrImage` (the same payload as a PNG data URL, ready for an `<img>`). |
 | `POST` | `/init` | Initialize the socket / (re)generate a QR. |
 | `POST` | `/force-reconnect` | Tear down and re-establish the socket. |
 | `POST` | `/clear-session` | Delete saved auth (logs out; a new QR scan is required). |
@@ -91,6 +115,8 @@ All configuration is via environment variables. See [`.env.example`](.env.exampl
 
 | Method | Path | Body |
 |---|---|---|
+| `POST` | `/group/create` | `{ subject, participants? }` — create a group owned by the paired account. `participants` is an optional array of JIDs and may be empty. Returns `{ groupJid, subject, participants, inviteCode, inviteUrl }`. |
+| `POST` | `/group/invite-url` | `{ groupId }` — current invite link for a group you administer. Returns `{ inviteCode, inviteUrl }`. |
 | `POST` | `/group/join` | `{ groupUrl }` — join via an invite link. |
 | `POST` | `/group/get-jid` | `{ groupUrl }` — resolve an invite link to a group JID. |
 | `POST` | `/group/add-participant` | `{ groupId, userJid }` |
@@ -127,6 +153,11 @@ Direct messages use `groupId: "direct_<senderJid>"`, `groupName: "Direct Message
 
 ## Deployment notes
 
+- **Run exactly one replica.** WhatsApp allows one active socket per linked
+  device: a second replica pairs a competing socket and both get knocked out
+  with the `440` conflict, in a loop. This is the single most damaging thing to
+  get wrong, and horizontal autoscaling must stay off. [`railway.json`](railway.json)
+  pins `numReplicas: 1` for that reason.
 - **Bind `0.0.0.0`** and honor the assigned `PORT` (the service already does this).
 - **Persist `AUTH_DIR`** on a volume. On ephemeral filesystems (e.g. a container's `/tmp`) you lose the session — and the QR — on every deploy.
 - Keep `BAILEYS_LOG_LEVEL=error` in production to avoid logging cryptographic/session internals.
