@@ -158,7 +158,7 @@ let socket = null;
 let connectionState = 'close';
 let currentQRCode = null;
 let isReconnecting = false;
-let blockedBy405 = false;
+let whatsappRefused = false;
 let sessionInvalid401 = false; // Rastrear si la sesión es inválida (error 401)
 // Last disconnect diagnostic: populated on every connection.update close event
 let lastDisconnectInfo = null; // { code: number, message: string, at: string }
@@ -178,7 +178,8 @@ function broadcastConnectionState() {
     connectionState,
     hasQR: !!currentQRCode,
     phoneNumber: connected ? socket?.user?.id : null,
-    whatsappBlocked: blockedBy405,
+    whatsappBlocked: Boolean(whatsappRefused),
+    refusedCode: whatsappRefused || null,
     lastDisconnect: lastDisconnectInfo,
   });
   const data = `data: ${payload}\n\n`;
@@ -662,7 +663,7 @@ async function initSocket() {
         currentQRCode = null;
         cancelScheduledReconnect();
         isReconnecting = false;
-        blockedBy405 = false; // Reset bloqueo cuando conecta exitosamente
+        whatsappRefused = false; // Reset bloqueo cuando conecta exitosamente
         sessionInvalid401 = false; // Reset flag de sesión inválida cuando conecta exitosamente
         broadcastConnectionState();
       }
@@ -686,12 +687,22 @@ async function initSocket() {
         });
         broadcastConnectionState();
 
-        // Detectar error 405 y no reconectar automáticamente
-        if (statusCode === 405) {
-          blockedBy405 = true;
+        // 403 (forbidden) and 405 both mean WhatsApp is refusing this client,
+        // not that the connection glitched. Reconnecting is actively harmful:
+        // a rejected client hammering the auth endpoint is what turns a
+        // temporary block into a longer or permanent one. Stop, stay stopped,
+        // and make /status say so — recovery is a human decision.
+        //
+        // 403 in particular is what an account gets after behaviour WhatsApp
+        // reads as automated abuse. It does NOT clear by retrying.
+        if (statusCode === 403 || statusCode === 405) {
+          whatsappRefused = statusCode;
           isReconnecting = false;
           cancelScheduledReconnect();
-          console.log('[WhatsApp] Error 405 detectado - WhatsApp bloqueando conexión. No se reconectará automáticamente.');
+          console.error(
+            `[WhatsApp] Error ${statusCode}: WhatsApp está rechazando esta cuenta. ` +
+            'No se reconectará automáticamente. Reintentar alarga el bloqueo.',
+          );
           return; // Salir sin reconectar
         }
 
@@ -1159,7 +1170,7 @@ app.post('/init', async (req, res) => {
   try {
     // Clear any existing QR code and reset flags
     currentQRCode = null;
-    blockedBy405 = false; // Reset bloqueo para permitir reintento manual
+    whatsappRefused = false; // Reset bloqueo para permitir reintento manual
     sessionInvalid401 = false; // Reset flag de sesión inválida
     
     // Si hay un socket existente pero está cerrado, limpiarlo primero
@@ -1204,7 +1215,7 @@ app.post('/init', async (req, res) => {
         return res.json({ success: true, connected: true, message: 'Already connected' });
       }
       // Check if blocked by 405 during wait
-      if (blockedBy405) {
+      if (whatsappRefused) {
         console.log('[API] WhatsApp blocked (405) detected during wait');
         return res.json({ 
           success: false, 
@@ -1230,7 +1241,7 @@ app.post('/init', async (req, res) => {
     }
 
     // Timeout reached - check if blocked by 405
-    if (blockedBy405) {
+    if (whatsappRefused) {
       console.log('[API] WhatsApp blocked (405) - timeout reached');
       return res.json({ 
         success: false, 
@@ -1283,7 +1294,8 @@ app.get('/status', async (req, res) => {
     hasQR: !!currentQRCode,
     phoneNumber: connected && socket?.user ? socket.user.id : null,
     socketInitialized: !!socket,
-    whatsappBlocked: blockedBy405,
+    whatsappBlocked: Boolean(whatsappRefused),
+    refusedCode: whatsappRefused || null,
     lastDisconnect: lastDisconnectInfo,
   });
 });
@@ -1309,7 +1321,8 @@ app.get('/events', (req, res) => {
     connectionState,
     hasQR: !!currentQRCode,
     phoneNumber: connected ? socket?.user?.id : null,
-    whatsappBlocked: blockedBy405,
+    whatsappBlocked: Boolean(whatsappRefused),
+    refusedCode: whatsappRefused || null,
     lastDisconnect: lastDisconnectInfo,
   })}\n\n`);
 
@@ -2057,7 +2070,7 @@ function startWatchdog () {
   }
   setInterval(() => {
     try {
-      if (blockedBy405 || sessionInvalid401) return; // Nothing the watchdog can fix
+      if (whatsappRefused || sessionInvalid401) return; // Nothing the watchdog can fix
       if (!isWithinActiveHours()) return;
 
       // Stay out of the way while a connection attempt is already in flight: a
