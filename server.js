@@ -157,6 +157,8 @@ const waLogger = pino({ level: process.env.BAILEYS_LOG_LEVEL || 'error' });
 let socket = null;
 let connectionState = 'close';
 let currentQRCode = null;
+let currentPairingCode = null;
+let currentPairingPhone = null;
 let isReconnecting = false;
 let whatsappRefused = false;
 let sessionInvalid401 = false; // Rastrear si la sesión es inválida (error 401)
@@ -177,6 +179,7 @@ function broadcastConnectionState() {
     connected,
     connectionState,
     hasQR: !!currentQRCode,
+    pairingCode: currentPairingCode,
     phoneNumber: connected ? socket?.user?.id : null,
     whatsappBlocked: Boolean(whatsappRefused),
     refusedCode: whatsappRefused || null,
@@ -396,6 +399,8 @@ async function clearAuthSession() {
     // Resetear estado
     connectionState = 'close';
     currentQRCode = null;
+    currentPairingCode = null;
+    currentPairingPhone = null;
     isReconnecting = false;
     sessionInvalid401 = false; // Reset flag de sesión inválida
     
@@ -661,6 +666,8 @@ async function initSocket() {
       if (connection === 'open') {
         console.log('[WhatsApp] ✅ Conectado');
         currentQRCode = null;
+        currentPairingCode = null;
+        currentPairingPhone = null;
         cancelScheduledReconnect();
         isReconnecting = false;
         whatsappRefused = false; // Reset bloqueo cuando conecta exitosamente
@@ -1113,6 +1120,122 @@ app.get('/qr', async (req, res) => {
   res.json({ success: true, qrCode: currentQRCode, qrImage });
 });
 
+function normalizePairingPhone (input) {
+  return String(input || '').replace(/\D/g, '');
+}
+
+function formatPairingCode (code) {
+  const raw = String(code || '').replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+  if (raw.length < 8) return raw;
+  return `${raw.slice(0, 4)}-${raw.slice(4, 8)}`;
+}
+
+function pairingPhoneError (phone) {
+  if (!phone) return 'phone_required';
+  if (phone.length < 8 || phone.length > 15) return 'invalid_phone';
+  return null;
+}
+
+async function requestPairingCodeWithRetry (sock, phone) {
+  if (!sock?.requestPairingCode) {
+    return { success: false, error: 'pairing_unsupported' };
+  }
+  if (sock.authState?.creds?.registered) {
+    return { success: false, error: 'already_registered' };
+  }
+  const requestOnce = async () => {
+    const code = await sock.requestPairingCode(phone);
+    if (!code) return { success: false, error: 'empty_code' };
+    return { success: true, pairingCode: formatPairingCode(code) };
+  };
+  try {
+    return await requestOnce();
+  } catch (err) {
+    console.error('[WhatsApp] requestPairingCode failed, retrying once:', err?.message || err);
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    if (sock.authState?.creds?.registered) {
+      return { success: false, error: 'already_registered' };
+    }
+    return await requestOnce();
+  }
+}
+
+/**
+ * POST /pairing-code
+ * Companion-device link without scanning a QR: the phone enters this 8-char
+ * code under Linked devices → Link with phone number instead.
+ * Body: { phoneNumber } with country code, digits only (e.g. 15551234567).
+ */
+app.post('/pairing-code', async (req, res) => {
+  const phone = normalizePairingPhone(req.body?.phoneNumber);
+  const phoneErr = pairingPhoneError(phone);
+  if (phoneErr) {
+    return res.status(400).json({
+      success: false,
+      error: phoneErr,
+      message: 'Include the country code, digits only (no + or spaces).',
+    });
+  }
+
+  try {
+    if (connectionState === 'open' && socket?.user) {
+      return res.json({ success: true, connected: true, phoneNumber: socket.user.id });
+    }
+    if (whatsappRefused) {
+      return res.json({ success: false, whatsappBlocked: true, error: 'blocked' });
+    }
+    if (
+      currentPairingCode &&
+      currentPairingPhone === phone &&
+      socket &&
+      !socket.authState?.creds?.registered
+    ) {
+      return res.json({ success: true, pairingCode: currentPairingCode });
+    }
+
+    if (!socket) {
+      const sock = await initSocket();
+      if (!sock) {
+        return res.status(500).json({ success: false, error: 'Failed to initialize socket' });
+      }
+    }
+
+    for (let i = 0; i < 20; i++) {
+      if (currentQRCode) break;
+      if (connectionState === 'open' && socket?.user) {
+        return res.json({ success: true, connected: true, phoneNumber: socket.user.id });
+      }
+      if (whatsappRefused) {
+        return res.json({ success: false, whatsappBlocked: true, error: 'blocked' });
+      }
+      if (sessionInvalid401) {
+        return res.json({ success: false, error: 'session_invalid', sessionInvalid: true });
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    if (currentQRCode) {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+
+    const result = await requestPairingCodeWithRetry(socket, phone);
+    if (!result.success) {
+      if (result.error === 'already_registered') {
+        return res.json({ success: true, connected: connectionState === 'open' });
+      }
+      return res.status(500).json({ success: false, error: result.error });
+    }
+
+    currentPairingCode = result.pairingCode;
+    currentPairingPhone = phone;
+    broadcastConnectionState();
+    console.log('[WhatsApp] Pairing code issued for', phone);
+    return res.json({ success: true, pairingCode: result.pairingCode });
+  } catch (error) {
+    console.error('[API] Error in /pairing-code:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 /**
  * POST /clear-session
  * Wipe auth session and disconnect. After this, call /init to get a new QR.
@@ -1170,6 +1293,8 @@ app.post('/init', async (req, res) => {
   try {
     // Clear any existing QR code and reset flags
     currentQRCode = null;
+    currentPairingCode = null;
+    currentPairingPhone = null;
     whatsappRefused = false; // Reset bloqueo para permitir reintento manual
     sessionInvalid401 = false; // Reset flag de sesión inválida
     
@@ -1292,6 +1417,7 @@ app.get('/status', async (req, res) => {
     connected,
     connectionState,
     hasQR: !!currentQRCode,
+    pairingCode: currentPairingCode,
     phoneNumber: connected && socket?.user ? socket.user.id : null,
     socketInitialized: !!socket,
     whatsappBlocked: Boolean(whatsappRefused),
@@ -1320,6 +1446,7 @@ app.get('/events', (req, res) => {
     connected,
     connectionState,
     hasQR: !!currentQRCode,
+    pairingCode: currentPairingCode,
     phoneNumber: connected ? socket?.user?.id : null,
     whatsappBlocked: Boolean(whatsappRefused),
     refusedCode: whatsappRefused || null,

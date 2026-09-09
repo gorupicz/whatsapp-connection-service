@@ -1,6 +1,6 @@
 # WhatsApp Connection Service
 
-A small, self-hosted HTTP service that keeps a **persistent WhatsApp Web connection** alive (via [Baileys](https://github.com/WhiskeySockets/Baileys)) and exposes it over a plain **REST API**: QR pairing, health/status, sending messages, basic group management, and forwarding inbound messages to your own webhook.
+A small, self-hosted HTTP service that keeps a **persistent WhatsApp Web connection** alive (via [Baileys](https://github.com/WhiskeySockets/Baileys)) and exposes it over a plain **REST API**: QR or phone pairing-code auth, health/status, sending messages, basic group management, and forwarding inbound messages to your own webhook.
 
 It is built to survive the messy realities of a long-lived WhatsApp socket: an **auto-reconnect loop** with exponential backoff, an in-process **watchdog** that detects a silently-dropped ("zombie") socket and re-establishes it, and explicit handling of WhatsApp's disconnect reasons (`401` logged-out, `405` blocked, `440` conflict, `515` restart-required, `408` timeout).
 
@@ -29,7 +29,7 @@ npm start
 Then pair your number:
 
 1. `POST /init` (or just start the service — it auto-inits unless `WHATSAPP_AUTO_INIT=0`).
-2. `GET /qr` to fetch the current QR code, and scan it from **WhatsApp → Linked devices**.
+2. `GET /qr` to fetch the current QR, or `POST /pairing-code` with `{ phoneNumber }` (country code, digits only) to get an 8-char code for **WhatsApp → Linked devices → Link with phone number instead**.
 3. `GET /status` should now report `connected: true`. Credentials are saved under `AUTH_DIR` and reused on restart.
 
 ## Authentication
@@ -97,6 +97,7 @@ All configuration is via environment variables. See [`.env.example`](.env.exampl
 | `GET` | `/status` | Detailed connection status. |
 | `GET` | `/events` | Server-Sent Events stream of connection state changes. |
 | `GET` | `/qr` | Current QR code (while pairing). Returns `qrCode` (raw Baileys payload) and `qrImage` (the same payload as a PNG data URL, ready for an `<img>`). |
+| `POST` | `/pairing-code` | `{ phoneNumber }` — companion pairing code (country code, digits only). Alternative to scanning the QR. |
 | `POST` | `/init` | Initialize the socket / (re)generate a QR. |
 | `POST` | `/force-reconnect` | Tear down and re-establish the socket. |
 | `POST` | `/clear-session` | Delete saved auth (logs out; a new QR scan is required). |
