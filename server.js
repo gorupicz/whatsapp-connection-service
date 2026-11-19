@@ -1778,10 +1778,17 @@ function extractInviteCode(groupUrl) {
  * link rather than being added outright. The invite URL is resolved in the
  * same call because that is what every caller wants next, and a second
  * round-trip is another chance for the socket to drop in between.
+ *
+ * Optional:
+ *   - parentCommunityJid: create the group INSIDE that community (the paired
+ *     account must administer it).
+ *   - description: set as the group description right after creation. Unlike
+ *     a message, a newcomer can read it no matter when they join — WhatsApp
+ *     shows people who arrive through the link no history.
  */
 app.post('/group/create', async (req, res) => {
   try {
-    const { subject, participants } = req.body;
+    const { subject, participants, parentCommunityJid, description } = req.body;
 
     if (!subject || typeof subject !== 'string' || !subject.trim()) {
       return res.status(400).json({ success: false, error: 'subject is required' });
@@ -1796,9 +1803,16 @@ app.post('/group/create', async (req, res) => {
     }
 
     const list = participants || [];
-    console.log('[API] Creating group:', { subject, participants: list.length });
+    const inCommunity = typeof parentCommunityJid === 'string' && parentCommunityJid.trim() !== '';
+    console.log('[API] Creating group:', {
+      subject,
+      participants: list.length,
+      ...(inCommunity ? { parentCommunityJid } : {}),
+    });
 
-    const group = await sock.groupCreate(subject.trim(), list);
+    const group = inCommunity
+      ? await sock.communityCreateGroup(subject.trim(), list, parentCommunityJid.trim())
+      : await sock.groupCreate(subject.trim(), list);
     const groupJid = group?.id;
     if (!groupJid) {
       return res.status(502).json({ success: false, error: 'Group created but no JID returned' });
@@ -1807,6 +1821,14 @@ app.post('/group/create', async (req, res) => {
     // Which participants actually made it in. WhatsApp silently drops numbers
     // that block group adds, so the caller must be able to tell.
     const added = (group?.participants || []).map((p) => p.id || p.jid).filter(Boolean);
+
+    if (typeof description === 'string' && description.trim()) {
+      try {
+        await sock.groupUpdateDescription(groupJid, description.trim());
+      } catch (error) {
+        console.error('[API] Group created but setting its description failed:', error?.message || error);
+      }
+    }
 
     let inviteUrl = null;
     let inviteCode = null;
